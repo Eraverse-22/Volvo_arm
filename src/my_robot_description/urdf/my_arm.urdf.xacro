@@ -7,10 +7,11 @@
       <child link="base_link"/>
       <origin xyz="0 0 0" rpy="0 0 0"/>
   </joint>
+  <xacro:include filename="$(find my_robot_description)/urdf/volvo_arm.ros2_control.xacro"/>
 
-  <!-- <xacro:include filename="$(find my_robot_description)/urdf/volvo_arm.ros2_control.xacro"/> -->
+
   <!-- Dummy world link — required because KDL cannot handle inertia on root link -->
-\
+
                                                    <!-- Base Link -->
   <link
     name="base_link">
