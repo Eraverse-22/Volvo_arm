@@ -13,7 +13,7 @@ class CameraNode(Node):
         self.bridge = CvBridge()
         self.cap = None
 
-        self.cap = cv2.VideoCapture(2, cv2.CAP_V4L2)
+        self.cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
         if not self.cap.isOpened():
             self.cap = cv2.VideoCapture(1)
 
