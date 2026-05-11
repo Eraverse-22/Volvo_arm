@@ -1,0 +1,19 @@
+<launch>
+    <let name="urdf_file" 
+         value="$(find-pkg-share my_robot_description)/urdf/my_arm.urdf.xacro"/>
+    <let name="rviz_config" 
+         value="$(find-pkg-share my_robot_description)/rviz/volvo.rviz"/>
+    
+    <node pkg="robot_state_publisher" exec="robot_state_publisher">
+        <param name="robot_description"
+               value="$(command 'xacro $(var urdf_file)')"/>
+    </node>
+
+    <node pkg="joint_state_publisher_gui" exec="joint_state_publisher_gui"/>
+
+    <node pkg="rviz2" exec="rviz2"
+           args="-d $(var rviz_config)"
+          output="screen"/>
+        
+           <!-- args="-d $(var rviz_config)"  -->
+</launch>
