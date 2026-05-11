@@ -30,7 +30,6 @@ class VolvoArucoDetector(Node):
 
         self.aruco_dict   = aruco.getPredefinedDictionary(aruco.DICT_ARUCO_ORIGINAL)
 
-        # Tuned params for stable detection under flat/uniform lighting
         params = aruco.DetectorParameters()
         params.adaptiveThreshWinSizeMin  = 3
         params.adaptiveThreshWinSizeMax  = 53
@@ -46,52 +45,81 @@ class VolvoArucoDetector(Node):
         params.cornerRefinementMinAccuracy  = 0.1
 
         self.detector = aruco.ArucoDetector(self.aruco_dict, params)
-
-        # CLAHE — better than equalizeHist for uniform backgrounds
-        self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        self.clahe    = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
         self.bridge         = CvBridge()
-        self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
+        self.tf_broadcaster = tf2_ros.StaticTransformBroadcaster(self)
+
+        # ── Lock state ────────────────────────────────────────────────────────
+        self._locked          = False   # True after first good detection
+        self._stable_count    = 0
+        self._last_positions  = None
+        REQUIRED_STABLE       = 5       # consecutive matching frames before lock
+        self.REQUIRED_STABLE  = REQUIRED_STABLE
+        self._locked_marker_tfs = []    # store for periodic republish
 
         self.create_subscription(Image, '/camera/image_raw', self.image_callback, 10)
         self.pub_debug    = self.create_publisher(Image, '/volvo/aruco/debug_image', 10)
         self.pub_detected = self.create_publisher(Bool,  '/paper_detected', 10)
 
+        # Republish static TFs at 1 Hz so RViz and TF tree never time out
+        self.create_timer(1.0, self._republish_static)
+
         cv2.namedWindow("ArUco Debug", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("ArUco Debug", 1280, 720)
-        self.get_logger().info("ArUco Node Running — stable detection mode")
+        self.get_logger().info("ArUco Node — one-shot lock mode (need 5 stable frames)")
+
+    # ── Static TF republisher ─────────────────────────────────────────────────
+
+    def _republish_static(self):
+        if self._locked and self._locked_marker_tfs:
+            now = self.get_clock().now().to_msg()
+            for tf in self._locked_marker_tfs:
+                tf.header.stamp = now
+            self.tf_broadcaster.sendTransform(self._locked_marker_tfs)
+
+    # ── Preprocessing ─────────────────────────────────────────────────────────
 
     def preprocess(self, frame):
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        # CLAHE on full image
+        gray     = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         enhanced = self.clahe.apply(gray)
-        # Gentle blur to kill sensor noise without killing marker edges
-        blurred  = cv2.GaussianBlur(enhanced, (3, 3), 0)
-        return blurred
+        return cv2.GaussianBlur(enhanced, (3, 3), 0)
 
     def detect_best(self, gray):
-        """Try raw gray first, then sharpen pass — return whichever gives more markers."""
         corners1, ids1, _ = self.detector.detectMarkers(gray)
         count1 = len(ids1) if ids1 is not None else 0
         if count1 == 4:
             return corners1, ids1
-
-        # Unsharp mask to recover edges lost in flat lighting
         sharp = cv2.addWeighted(gray, 1.5,
                                 cv2.GaussianBlur(gray, (5, 5), 0), -0.5, 0)
         corners2, ids2, _ = self.detector.detectMarkers(sharp)
         count2 = len(ids2) if ids2 is not None else 0
-
         return (corners2, ids2) if count2 >= count1 else (corners1, ids1)
+
+    # ── Main callback ─────────────────────────────────────────────────────────
 
     def image_callback(self, msg):
         frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        gray  = self.preprocess(frame)
-        corners, ids = self.detect_best(gray)
 
-        now            = self.get_clock().now().to_msg()
-        marker_positions = {}
-        paper_detected   = False
+        # ── Already locked — just show frozen overlay ─────────────────────────
+        if self._locked:
+            cv2.putText(frame, "PAPER LOCKED — TF frozen", (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+            cv2.putText(frame, "Restart node to re-detect", (20, 80),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180, 180, 180), 2)
+            self.pub_detected.publish(Bool(data=True))
+            self.pub_debug.publish(self.bridge.cv2_to_imgmsg(frame, "bgr8"))
+            cv2.imshow("ArUco Debug", frame)
+            cv2.waitKey(1)
+            return
+
+        # ── Still searching ───────────────────────────────────────────────────
+        gray    = self.preprocess(frame)
+        corners, ids = self.detect_best(gray)
+        n = len(ids) if ids is not None else 0
+
+        cv2.putText(frame, f"Searching... stable {self._stable_count}/{self.REQUIRED_STABLE}",
+                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
 
         half = self.marker_size / 2.0
         object_points = np.array([
@@ -101,16 +129,11 @@ class VolvoArucoDetector(Node):
             [-half, -half, 0]
         ], dtype=np.float32)
 
-        cv2.putText(frame, "ARUCO SYSTEM ACTIVE", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
-
-        n = len(ids) if ids is not None else 0
-
         if n > 0:
             aruco.drawDetectedMarkers(frame, corners, ids)
 
         if n == 4:
-            # Assign corner index by image position: TL=0 TR=1 BR=2 BL=3
+            # Sort into TL=0 TR=1 BR=2 BL=3
             detections = []
             for i in range(4):
                 cx = float(corners[i][0][:, 0].mean())
@@ -120,7 +143,10 @@ class VolvoArucoDetector(Node):
             detections.sort(key=lambda d: d[1])
             top = sorted(detections[:2], key=lambda d: d[0])
             bot = sorted(detections[2:], key=lambda d: d[0])
-            ordered = [top[0], top[1], bot[1], bot[0]]  # TL TR BR BL
+            ordered = [top[0], top[1], bot[1], bot[0]]
+
+            marker_positions = {}
+            pose_data = []   # (rvec, tvec, idx)
 
             for idx, (cx, cy, corner) in enumerate(ordered):
                 image_points = corner[0].astype(np.float32)
@@ -131,45 +157,75 @@ class VolvoArucoDetector(Node):
                 if not success:
                     continue
                 marker_positions[idx] = tvec.flatten()
-                self.broadcast_tf(rvec, tvec, f"aruco_marker_{idx}", now)
+                pose_data.append((rvec, tvec, idx, cx, cy))
                 cv2.drawFrameAxes(frame, self.camera_matrix, self.dist_coeffs,
                                   rvec, tvec, 0.03)
                 cv2.putText(frame, str(idx), (int(cx) + 10, int(cy) - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
 
+            if len(marker_positions) == 4:
+                positions_flat = np.array([marker_positions[i] for i in range(4)])
+
+                # Stability gate: check if positions are consistent with last frame
+                if self._last_positions is not None:
+                    diff = np.max(np.linalg.norm(positions_flat - self._last_positions, axis=1))
+                    if diff < 0.005:   # 5mm threshold
+                        self._stable_count += 1
+                    else:
+                        self._stable_count = 0
+                else:
+                    self._stable_count = 1
+
+                self._last_positions = positions_flat
+
+                cv2.putText(frame,
+                            f"Stable: {self._stable_count}/{self.REQUIRED_STABLE}",
+                            (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 200, 255), 2)
+
+                # ── Lock when stable enough ───────────────────────────────────
+                if self._stable_count >= self.REQUIRED_STABLE:
+                    now = self.get_clock().now().to_msg()
+                    tfs = []
+
+                    for rvec, tvec, idx, _, _ in pose_data:
+                        tfs.append(self._make_tf(rvec, tvec,
+                                                 f"aruco_marker_{idx}", now))
+
+                    # paper_origin
+                    p = [marker_positions[i] for i in range(4)]
+                    centroid = np.mean(p, axis=0)
+                    quat = np.array([0.0, 0.0, 0.0, 1.0])  # No rotation relative to camera frame
+                    tfs.append(self._make_tf_quat(quat, centroid.reshape(3,1),
+                                                  "paper_origin", now))
+
+                    self.tf_broadcaster.sendTransform(tfs)
+                    self._locked_marker_tfs = tfs
+                    self._locked = True
+
+                    self.get_logger().info(
+                        f"LOCKED — paper_origin at "
+                        f"x={centroid[0]:.3f} y={centroid[1]:.3f} z={centroid[2]:.3f} "
+                        f"(camera_frame)")
+
         elif 0 < n < 4:
-            cv2.putText(frame, f"PARTIAL: {n}/4 markers", (20, 80),
+            self._stable_count = 0
+            self._last_positions = None
+            cv2.putText(frame, f"PARTIAL: {n}/4", (20, 80),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 2)
         else:
-            cv2.putText(frame, "NO MARKERS DETECTED", (20, 80),
+            self._stable_count = 0
+            self._last_positions = None
+            cv2.putText(frame, "NO MARKERS", (20, 80),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
 
-        if len(marker_positions) == 4:
-            p = [marker_positions[i] for i in range(4)]
-            centroid = np.mean(p, axis=0)
-
-            x_axis = p[1] - p[0];  x_axis /= np.linalg.norm(x_axis)
-            y_axis = p[3] - p[0];  y_axis /= np.linalg.norm(y_axis)
-            z_axis = np.cross(x_axis, y_axis); z_axis /= np.linalg.norm(z_axis)
-            y_axis = np.cross(z_axis, x_axis); y_axis /= np.linalg.norm(y_axis)
-
-            rot  = np.column_stack((x_axis, y_axis, z_axis))
-            quat = R.from_matrix(rot).as_quat()
-            self.broadcast_tf_quaternion(quat, centroid.reshape(3, 1), "paper_origin", now)
-
-            paper_detected = True
-            all_pts   = np.vstack(corners).reshape(-1, 2)
-            center_px = tuple(np.mean(all_pts, axis=0).astype(int))
-            cv2.circle(frame, center_px, 12, (0, 0, 255), -1)
-            cv2.putText(frame, "PAPER ORIGIN", (center_px[0] + 10, center_px[1] + 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-
-        self.pub_detected.publish(Bool(data=paper_detected))
+        self.pub_detected.publish(Bool(data=False))
         self.pub_debug.publish(self.bridge.cv2_to_imgmsg(frame, "bgr8"))
         cv2.imshow("ArUco Debug", frame)
         cv2.waitKey(1)
 
-    def broadcast_tf(self, rvec, tvec, child, stamp):
+    # ── TF builders ───────────────────────────────────────────────────────────
+
+    def _make_tf(self, rvec, tvec, child, stamp):
         tf = TransformStamped()
         tf.header.stamp    = stamp
         tf.header.frame_id = "camera_frame"
@@ -183,9 +239,9 @@ class VolvoArucoDetector(Node):
         tf.transform.rotation.y = float(quat[1])
         tf.transform.rotation.z = float(quat[2])
         tf.transform.rotation.w = float(quat[3])
-        self.tf_broadcaster.sendTransform(tf)
+        return tf
 
-    def broadcast_tf_quaternion(self, quat, tvec, child, stamp):
+    def _make_tf_quat(self, quat, tvec, child, stamp):
         tf = TransformStamped()
         tf.header.stamp    = stamp
         tf.header.frame_id = "camera_frame"
@@ -197,7 +253,7 @@ class VolvoArucoDetector(Node):
         tf.transform.rotation.y = float(quat[1])
         tf.transform.rotation.z = float(quat[2])
         tf.transform.rotation.w = float(quat[3])
-        self.tf_broadcaster.sendTransform(tf)
+        return tf
 
 
 def main(args=None):
