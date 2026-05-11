@@ -1,0 +1,10 @@
+<library path="volvo_hardware_interface">
+  <class
+    name="volvo_hardware_interface/VolvoHardwareInterface"
+    type="volvo_hardware_interface::VolvoHardwareInterface"
+    base_class_type="hardware_interface::SystemInterface">
+    <description>
+      Custom hardware interface for Volvo arm via ESP32 serial
+    </description>
+  </class>
+</library>
