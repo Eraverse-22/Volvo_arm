@@ -1,0 +1,10 @@
+moveit_setup_assistant_config:
+  urdf:
+    package: my_robot_description
+    relative_path: urdf/my_arm.urdf.xacro
+  srdf:
+    relative_path: config/volvo_arm.srdf
+  package_settings:
+    author_name: mtrs22
+    author_email: mtrs223211@gmail.com
+    generated_timestamp: 1778490649
