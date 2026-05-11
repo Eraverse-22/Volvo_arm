@@ -28,6 +28,7 @@ setup(
             'aruco_detector_node = volvo_vision.aruco_detector_node:main',
             'shape_detector_node = volvo_vision.shape_detection_node:main',
             'pixel_unprojector_node = volvo_vision.pixel_unprojector_node:main',
+            'target_marker_server = volvo_vision.target_marker_server:main',
         ],
     },
 )
