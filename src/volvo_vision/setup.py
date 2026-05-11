@@ -26,6 +26,7 @@ setup(
         'console_scripts': [
             'camera_node = volvo_vision.camera_node:main',
             'aruco_detector_node = volvo_vision.aruco_detector_node:main',
+            'shape_detector_node = volvo_vision.shape_detection_node:main',
         ],
     },
 )
