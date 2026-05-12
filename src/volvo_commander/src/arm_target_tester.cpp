@@ -102,7 +102,7 @@ int main(int argc, char* argv[])
 
                 auto& p = target_base.pose.position;
                 auto& o = target_base.pose.orientation;
-                p.z = Z_HOVER;  // override z to hover height for safety — only XY should affect reachability
+                p.z = Z_TOUCH;  // override z to touch height for safety — only XY should affect reachability
                 o.x = 1.0; o.y = 0.0; o.z = 0.0; o.w = 0.0;  // override orientation to fixed downwards-facing for safety
 
                 // ── SAFETY CHECKS ─────────────────────────────────────────────

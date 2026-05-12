@@ -3,24 +3,13 @@
 pixel_unprojector_node.py — volvo_arm Phase 3
 ==============================================
 Converts pixel waypoints → 3D points in paper_origin frame.
-
-PIPELINE per pixel (u, v):
-  1. Unproject (u,v) → ray in camera_frame using K^-1
-  2. TF lookup: camera_frame → paper_origin
-  3. Transform ray origin + direction into paper_origin frame
-  4. Intersect ray with paper plane (Z=0 in paper_origin)
-  5. Publish 3D point (x, y, 0) in paper_origin frame
-
-TOPICS
-  Sub:  /volvo/shape/pixels            std_msgs/Float32MultiArray
-  Pub:  /volvo/shape/waypoints_3d      geometry_msgs/PoseArray
-        /volvo/shape/waypoints_marker   visualization_msgs/MarkerArray
-
-NaN,NaN in pixel list = pen-lift separator (preserved as NaN in output)
+Uses TRANSIENT_LOCAL (latched) publisher so shape_drawer
+can receive waypoints anytime after detection.
 """
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy, HistoryPolicy
 from std_msgs.msg import Float32MultiArray
 from geometry_msgs.msg import PoseArray, Pose, Point
 from visualization_msgs.msg import MarkerArray, Marker
@@ -39,8 +28,6 @@ K = np.array([
 
 K_INV = np.linalg.inv(K)
 
-# Pen z-offset above paper surface (meters)
-# 0.0 = touching paper, increase for hover
 PEN_Z_CONTACT = 0.002
 
 
@@ -52,6 +39,14 @@ class PixelUnprojectorNode(Node):
         self.tf_buffer   = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
+        # ── Latched QoS — shape_drawer receives even after this node publishes ──
+        latched_qos = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST
+        )
+
         self.create_subscription(
             Float32MultiArray,
             '/volvo/shape/pixels',
@@ -60,13 +55,12 @@ class PixelUnprojectorNode(Node):
         )
 
         self.pub_poses   = self.create_publisher(
-            PoseArray, '/volvo/shape/waypoints_3d', 10)
+            PoseArray, '/volvo/shape/waypoints_3d', latched_qos)
         self.pub_markers = self.create_publisher(
             MarkerArray, '/volvo/shape/waypoints_marker', 10)
 
-        self.get_logger().info('PixelUnprojectorNode ready | waiting for /volvo/shape/pixels')
-
-    # ── Main callback ──────────────────────────────────────────────────────────
+        self.get_logger().info(
+            'PixelUnprojectorNode ready | waiting for /volvo/shape/pixels')
 
     def _pixels_cb(self, msg: Float32MultiArray):
         flat = msg.data
@@ -77,22 +71,21 @@ class PixelUnprojectorNode(Node):
         # ── TF lookup: camera_frame → paper_origin ─────────────────────────
         try:
             tf_stamped = self.tf_buffer.lookup_transform(
-                'paper_origin',    # target frame
-                'camera_frame',    # source frame
-                rclpy.time.Time(), # latest available
+                'paper_origin',
+                'camera_frame',
+                rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=2.0)
             )
         except Exception as e:
             self.get_logger().error(f'TF lookup failed: {e}')
             return
 
-        # Extract rotation matrix and translation from TF
-        t  = tf_stamped.transform.translation
-        q  = tf_stamped.transform.rotation
+        t     = tf_stamped.transform.translation
+        q     = tf_stamped.transform.rotation
         t_vec = np.array([t.x, t.y, t.z], dtype=np.float64)
         R_mat = self._quat_to_matrix(q.x, q.y, q.z, q.w)
 
-        # ── Parse pixel list — handle NaN separators ───────────────────────
+        # ── Parse pixel list ────────────────────────────────────────────────
         pts_2d = []
         i = 0
         while i < len(flat) - 1:
@@ -105,14 +98,13 @@ class PixelUnprojectorNode(Node):
                 pts_2d.append((u, v))
 
         # ── Unproject each pixel ────────────────────────────────────────────
-        pts_3d = []
+        pts_3d     = []
         fail_count = 0
 
         for (u, v) in pts_2d:
             if math.isnan(u):
-                pts_3d.append(None)   # pen-lift marker
+                pts_3d.append(None)
                 continue
-
             pt = self._unproject(u, v, R_mat, t_vec)
             if pt is None:
                 fail_count += 1
@@ -120,20 +112,19 @@ class PixelUnprojectorNode(Node):
             pts_3d.append(pt)
 
         valid = sum(1 for p in pts_3d if p is not None)
+        lifts = sum(1 for p in pts_3d if p is None)
         self.get_logger().info(
             f'Unprojected {valid}/{len(pts_2d)} pixels | '
-            f'{fail_count} ray-plane misses | '
-            f'pen-lifts={sum(1 for p in pts_3d if p is None and not math.isnan(0))}')
+            f'{fail_count} ray-plane misses | pen-lifts={lifts}')
 
-        # ── Publish PoseArray ───────────────────────────────────────────────
-        pose_array = PoseArray()
+        # ── Publish PoseArray (latched) ─────────────────────────────────────
+        pose_array            = PoseArray()
         pose_array.header.frame_id = 'paper_origin'
         pose_array.header.stamp    = self.get_clock().now().to_msg()
 
         for pt in pts_3d:
             pose = Pose()
             if pt is None:
-                # Encode pen-lift as NaN position
                 pose.position.x = float('nan')
                 pose.position.y = float('nan')
                 pose.position.z = float('nan')
@@ -145,118 +136,76 @@ class PixelUnprojectorNode(Node):
             pose_array.poses.append(pose)
 
         self.pub_poses.publish(pose_array)
-
-        # ── Publish MarkerArray for RViz visualization ──────────────────────
-        self.pub_markers.publish(
-            self._build_markers(pts_3d))
+        self.pub_markers.publish(self._build_markers(pts_3d))
 
         self.get_logger().info(
-            f'Published {len(pose_array.poses)} poses to /volvo/shape/waypoints_3d')
-
-    # ── Unprojection math ──────────────────────────────────────────────────────
+            f'Published {len(pose_array.poses)} poses to '
+            f'/volvo/shape/waypoints_3d (latched)')
 
     def _unproject(self, u, v, R_mat, t_vec):
-        """
-        Unproject pixel (u,v) to 3D point on Z=0 plane of paper_origin.
-
-        Steps:
-          1. pixel → normalized camera ray:  d_cam = K^-1 * [u, v, 1]^T
-          2. rotate ray to paper_origin:      d_paper = R * d_cam
-          3. ray origin in paper_origin:      o_paper = t_vec
-          4. intersect with Z=0:
-               t_param = -o_paper.z / d_paper.z
-               pt = o_paper + t_param * d_paper
-        """
-        # Step 1 — ray direction in camera frame
         pixel_h = np.array([u, v, 1.0], dtype=np.float64)
         d_cam   = K_INV @ pixel_h
         d_cam  /= np.linalg.norm(d_cam)
-
-        # Step 2 — rotate to paper_origin frame
         d_paper = R_mat @ d_cam
-
-        # Step 3 — ray origin = camera position in paper_origin frame
         o_paper = t_vec
 
-        # Step 4 — intersect with paper plane Z=0
         if abs(d_paper[2]) < 1e-9:
-            return None   # ray parallel to paper plane
-
+            return None
         t_param = -o_paper[2] / d_paper[2]
-
         if t_param < 0:
-            return None   # intersection behind camera
+            return None
 
-        pt = o_paper + t_param * d_paper
-        return pt   # (x, y, ~0) in paper_origin frame
-
-    # ── RViz marker builder ────────────────────────────────────────────────────
+        return o_paper + t_param * d_paper
 
     def _build_markers(self, pts_3d) -> MarkerArray:
-        ma = MarkerArray()
-
-        # Delete all previous markers
-        delete_all        = Marker()
+        ma         = MarkerArray()
+        delete_all = Marker()
         delete_all.action = Marker.DELETEALL
         ma.markers.append(delete_all)
 
-        # Outline points — yellow spheres
-        outline_marker               = Marker()
-        outline_marker.header.frame_id = 'paper_origin'
-        outline_marker.header.stamp    = self.get_clock().now().to_msg()
-        outline_marker.ns              = 'outline'
-        outline_marker.id              = 1
-        outline_marker.type            = Marker.POINTS
-        outline_marker.action          = Marker.ADD
-        outline_marker.scale.x         = 0.003
-        outline_marker.scale.y         = 0.003
-        outline_marker.color.r         = 1.0
-        outline_marker.color.g         = 1.0
-        outline_marker.color.b         = 0.0
-        outline_marker.color.a         = 1.0
-        outline_marker.lifetime        = Duration(sec=0)
+        def make_marker(ns, mid, r, g, b, size):
+            m                    = Marker()
+            m.header.frame_id    = 'paper_origin'
+            m.header.stamp       = self.get_clock().now().to_msg()
+            m.ns                 = ns
+            m.id                 = mid
+            m.type               = Marker.POINTS
+            m.action             = Marker.ADD
+            m.scale.x            = size
+            m.scale.y            = size
+            m.color.r            = r
+            m.color.g            = g
+            m.color.b            = b
+            m.color.a            = 1.0
+            m.lifetime           = Duration(sec=0)
+            return m
 
-        fill_marker               = Marker()
-        fill_marker.header.frame_id = 'paper_origin'
-        fill_marker.header.stamp    = self.get_clock().now().to_msg()
-        fill_marker.ns              = 'fill'
-        fill_marker.id              = 2
-        fill_marker.type            = Marker.POINTS
-        fill_marker.action          = Marker.ADD
-        fill_marker.scale.x         = 0.002
-        fill_marker.scale.y         = 0.002
-        fill_marker.color.r         = 0.0
-        fill_marker.color.g         = 0.5
-        fill_marker.color.b         = 1.0
-        fill_marker.color.a         = 0.8
-        fill_marker.lifetime        = Duration(sec=0)
+        outline = make_marker('outline', 1, 1.0, 1.0, 0.0, 0.003)
+        fill    = make_marker('fill',    2, 0.0, 0.5, 1.0, 0.002)
 
-        # First stroke = outline (before first None), rest = fill
         in_outline = True
         for pt in pts_3d:
             if pt is None:
                 in_outline = False
                 continue
-            p = Point()
+            p   = Point()
             p.x = pt[0]
             p.y = pt[1]
             p.z = PEN_Z_CONTACT
             if in_outline:
-                outline_marker.points.append(p)
+                outline.points.append(p)
             else:
-                fill_marker.points.append(p)
+                fill.points.append(p)
 
-        ma.markers.append(outline_marker)
-        ma.markers.append(fill_marker)
+        ma.markers.append(outline)
+        ma.markers.append(fill)
         return ma
-
-    # ── Quaternion → rotation matrix ───────────────────────────────────────────
 
     def _quat_to_matrix(self, x, y, z, w) -> np.ndarray:
         return np.array([
-            [1 - 2*(y*y + z*z),   2*(x*y - z*w),     2*(x*z + y*w)],
-            [2*(x*y + z*w),       1 - 2*(x*x + z*z),  2*(y*z - x*w)],
-            [2*(x*z - y*w),       2*(y*z + x*w),       1 - 2*(x*x + y*y)]
+            [1-2*(y*y+z*z),   2*(x*y-z*w),   2*(x*z+y*w)],
+            [2*(x*y+z*w),   1-2*(x*x+z*z),   2*(y*z-x*w)],
+            [2*(x*z-y*w),     2*(y*z+x*w), 1-2*(x*x+y*y)]
         ], dtype=np.float64)
 
 
