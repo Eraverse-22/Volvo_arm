@@ -17,6 +17,14 @@ static const std::string TARGET_FRAME   = "base_link";
 static constexpr double  VEL_SCALE      = 0.1;
 static constexpr double  ACC_SCALE      = 0.1;
 
+// ── Safety limits — arm cannot go below or outside these ──────────────────────
+static constexpr double  Z_MIN          =  0.010;   // 1cm above table — hard floor
+static constexpr double  Z_MAX          =  0.200;   // 20cm above table — hard ceiling
+static constexpr double  XY_RADIUS_MAX  =  0.450;   // 45cm from base_link origin
+
+static constexpr double  Z_HOVER  = 0.12;   // draw_start hover height
+static constexpr double  Z_TOUCH  = 0.017;   // pen touching paper
+
 int main(int argc, char* argv[])
 {
     rclcpp::init(argc, argv);
@@ -35,7 +43,6 @@ int main(int argc, char* argv[])
     auto tf_listener = std::make_shared<tf2_ros::TransformListener>(
         *tf_buffer, node);
 
-    // ── THIS was the broken line — angle bracket missing in previous send ────
     auto arm = std::make_shared<moveit::planning_interface::MoveGroupInterface>(
         node, PLANNING_GROUP);
 
@@ -95,6 +102,49 @@ int main(int argc, char* argv[])
 
                 auto& p = target_base.pose.position;
                 auto& o = target_base.pose.orientation;
+                p.z = Z_HOVER;  // override z to hover height for safety — only XY should affect reachability
+                o.x = 1.0; o.y = 0.0; o.z = 0.0; o.w = 0.0;  // override orientation to fixed downwards-facing for safety
+
+                // ── SAFETY CHECKS ─────────────────────────────────────────────
+                double xy_radius = std::sqrt(p.x * p.x + p.y * p.y);
+
+                if (p.z < Z_MIN) {
+                    RCLCPP_ERROR(node->get_logger(),
+                        "\n"
+                        "╔══════════════════════════════════════╗\n"
+                        "║  SAFETY ABORT — Z TOO LOW            ║\n"
+                        "║  z=%.4f is below floor z=%.4f      ║\n"
+                        "║  Check static TF / paper_origin z    ║\n"
+                        "╚══════════════════════════════════════╝",
+                        p.z, Z_MIN);
+                    executing = false;
+                    return;
+                }
+
+                if (p.z > Z_MAX) {
+                    RCLCPP_ERROR(node->get_logger(),
+                        "\n"
+                        "╔══════════════════════════════════════╗\n"
+                        "║  SAFETY ABORT — Z TOO HIGH           ║\n"
+                        "║  z=%.4f is above ceiling z=%.4f    ║\n"
+                        "╚══════════════════════════════════════╝",
+                        p.z, Z_MAX);
+                    executing = false;
+                    return;
+                }
+
+                if (xy_radius > XY_RADIUS_MAX) {
+                    RCLCPP_ERROR(node->get_logger(),
+                        "\n"
+                        "╔══════════════════════════════════════╗\n"
+                        "║  SAFETY ABORT — XY OUT OF RANGE      ║\n"
+                        "║  radius=%.4f > max=%.4f            ║\n"
+                        "╚══════════════════════════════════════╝",
+                        xy_radius, XY_RADIUS_MAX);
+                    executing = false;
+                    return;
+                }
+                // ── END SAFETY CHECKS ─────────────────────────────────────────
 
                 // Step 2 — print and wait for confirmation
                 RCLCPP_INFO(node->get_logger(),
@@ -103,11 +153,13 @@ int main(int argc, char* argv[])
                     "  Target in %s:\n"
                     "    position  x=%.4f  y=%.4f  z=%.4f\n"
                     "    orient    x=%.4f  y=%.4f  z=%.4f  w=%.4f\n"
+                    "  Safety OK | xy_radius=%.4f\n"
                     "══════════════════════════════════════\n"
                     "  Press ENTER to execute, Ctrl+C to abort.",
                     TARGET_FRAME.c_str(),
                     p.x, p.y, p.z,
-                    o.x, o.y, o.z, o.w
+                    o.x, o.y, o.z, o.w,
+                    xy_radius
                 );
 
                 std::cin.ignore();
@@ -122,8 +174,7 @@ int main(int argc, char* argv[])
 
                 if (!ok) {
                     RCLCPP_ERROR(node->get_logger(),
-                        "Planning FAILED.\n"
-                        "  Check: pose reachable? TF broadcasting? Orientation valid?");
+                        "Planning FAILED — check pose reachability and TF.");
                     executing = false;
                     return;
                 }
@@ -151,10 +202,15 @@ int main(int argc, char* argv[])
         "\n"
         "─────────────────────────────────────────\n"
         "  arm_target_tester ready\n"
+        "  Safety limits active:\n"
+        "    Z floor  = %.3f m\n"
+        "    Z ceiling= %.3f m\n"
+        "    XY radius= %.3f m\n"
         "  Run target_marker_server.py in parallel\n"
         "  Drag marker in RViz, then:\n"
         "  ros2 topic pub /run_to_target std_msgs/msg/Bool \"data: true\" --once\n"
-        "─────────────────────────────────────────"
+        "─────────────────────────────────────────",
+        Z_MIN, Z_MAX, XY_RADIUS_MAX
     );
 
     spinner.join();

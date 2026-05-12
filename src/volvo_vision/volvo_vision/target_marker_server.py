@@ -28,7 +28,7 @@ class TargetMarkerServer(Node):
         self._pose = Pose()
         self._pose.position.x    = 0.0
         self._pose.position.y    = 0.0
-        self._pose.position.z    = 0.05   # 5 cm above paper — safe default
+        self._pose.position.z    = 0.0   # 11.7 cm above paper — safe default
         self._pose.orientation.w = 1.0
 
         self._server = InteractiveMarkerServer(self, 'arm_test_marker')
