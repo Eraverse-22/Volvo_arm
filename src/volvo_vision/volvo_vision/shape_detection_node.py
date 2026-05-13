@@ -1,19 +1,11 @@
 #!/usr/bin/env python3
 """
-shape_detection_node.py — volvo_arm Phase 2
-============================================
-Service-triggered shape detector.
-Publishes pixel waypoints on /volvo/shape/pixels
-
-TOPICS
-  Sub:  /camera/image_raw              sensor_msgs/Image
-        /paper_detected                std_msgs/Bool  (optional gate)
-  Pub:  /volvo/shape/pixels            std_msgs/Float32MultiArray
-        /volvo/shape/type              std_msgs/String
-        /volvo/shape/debug_image       sensor_msgs/Image
-
-SERVICE
-  /detect_shape                        std_srvs/Trigger
+shape_detection_node.py — volvo_arm Phase 2  (brush edition v3)
+================================================================
+Changes vs v2:
+  - Live debug frame shows paper detection area (green boundary) + contour bbox
+  - Brush reload encodes Z-lift: NaN, NaN, pause_s, last_u, last_v, Z_LIFT_MM
+    Executor must: move to (last_u, last_v, current_z + Z_LIFT_MM), wait pause_s, descend
 """
 
 import rclpy
@@ -30,18 +22,20 @@ import time
 
 _NAN = float('nan')
 
-# ── Tunable ────────────────────────────────────────────────────────────────────
-ROW_SPACING_PX  = 12
-COL_SPACING_PX  = 3
-OUTLINE_SAMPLES = 80
-MIN_SHAPE_AREA  = 1500      # lowered — square in image looks small
-APPROX_EPS      = 0.03
-CANNY_LOW       = 30
-CANNY_HIGH      = 100
-LOCK_FRAMES     = 3
+ROW_SPACING_PX       = 22
+COL_SPACING_PX       = 6
+OUTLINE_SAMPLES      = 80
+MIN_SHAPE_AREA       = 1500
+APPROX_EPS           = 0.03
+CANNY_LOW            = 30
+CANNY_HIGH           = 100
+LOCK_FRAMES          = 3
+BRUSH_RELOAD_PAUSE_S = 1.2
+Z_LIFT_MM            = 30.0   # mm to lift above last stroke point during reload
 
 _PAPER_LOWER = np.array([0,   0, 150], dtype=np.uint8)
 _PAPER_UPPER = np.array([180, 80, 255], dtype=np.uint8)
+_WIN = 'Shape Detection'
 
 
 class ShapeDetectionNode(Node):
@@ -50,97 +44,122 @@ class ShapeDetectionNode(Node):
         super().__init__('shape_detection_node')
         self.bridge = CvBridge()
 
-        # State
         self._paper_ready  = False
         self._locked       = False
         self._shape_label  = None
         self._latest_frame = None
         self._latest_debug = None
+        self._frame_h      = None
+        self._frame_w      = None
+        self._paper_mask   = None   # kept for live overlay
 
-        # Subscriptions
-        self.create_subscription(
-            Image, '/camera/image_raw', self._image_cb, 10)
-        self.create_subscription(
-            Bool, '/paper_detected', self._paper_cb, 10)
+        cv2.namedWindow(_WIN, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(_WIN, 800, 600)
 
-        # Publishers
-        self.pub_pixels = self.create_publisher(
-            Float32MultiArray, '/volvo/shape/pixels', 10)
-        self.pub_type   = self.create_publisher(
-            String, '/volvo/shape/type', 10)
-        self.pub_debug  = self.create_publisher(
-            Image, '/volvo/shape/debug_image', 10)
+        self.create_subscription(Image, '/camera/image_raw', self._image_cb, 10)
+        self.create_subscription(Bool,  '/paper_detected',   self._paper_cb, 10)
 
-        # Service
-        self.create_service(
-            Trigger, '/detect_shape', self._detect_srv_cb)
+        self.pub_pixels = self.create_publisher(Float32MultiArray, '/volvo/shape/pixels',     10)
+        self.pub_type   = self.create_publisher(String,            '/volvo/shape/type',        10)
+        self.pub_debug  = self.create_publisher(Image,             '/volvo/shape/debug_image', 10)
 
-        # Display timer — safe, runs in executor
+        self.create_service(Trigger, '/detect_shape', self._detect_srv_cb)
         self.create_timer(0.033, self._display_cb)
+        self.create_timer(3.0,   self._watchdog_cb)
 
-        # Watchdog timer — print status every 3s
-        self.create_timer(3.0, self._watchdog_cb)
+        self.get_logger().info('ShapeDetectionNode (brush v3) ready — call /detect_shape')
 
-        self.get_logger().info(
-            'ShapeDetectionNode ready | call /detect_shape to trigger')
+    # ── Axis flip ──────────────────────────────────────────────────────────────
+
+    def _flip_uv(self, pts: list) -> list:
+        if self._frame_h is None or self._frame_w is None:
+            return pts
+        H, W = self._frame_h, self._frame_w
+        return [((W - 1) - u, (H - 1) - v) for (u, v) in pts]
 
     # ── Watchdog ───────────────────────────────────────────────────────────────
 
     def _watchdog_cb(self):
-        frame_ok = self._latest_frame is not None
         self.get_logger().info(
-            f'[watchdog] frame={frame_ok} | paper_ready={self._paper_ready} | locked={self._locked}')
+            f'[watchdog] frame={self._latest_frame is not None} | '
+            f'paper_ready={self._paper_ready} | locked={self._locked}')
 
-    # ── Paper gate ─────────────────────────────────────────────────────────────
+    # ── Callbacks ──────────────────────────────────────────────────────────────
 
     def _paper_cb(self, msg: Bool):
         self._paper_ready = msg.data
 
-    # ── Image buffer ───────────────────────────────────────────────────────────
-
     def _image_cb(self, msg: Image):
         self._latest_frame = msg
-
         frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        self._frame_h, self._frame_w = frame.shape[:2]
         debug = frame.copy()
 
+        # ── Always show paper detection area ──────────────────────────────────
+        paper_mask = self._detect_paper(frame)
+        self._paper_mask = paper_mask
+        paper_px = cv2.countNonZero(paper_mask)
+
+        # Draw paper boundary in green
+        paper_cnts, _ = cv2.findContours(
+            paper_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(debug, paper_cnts, -1, (0, 220, 0), 2)
+
+        # Semi-transparent green fill over detected paper region
+        overlay = debug.copy()
+        cv2.drawContours(overlay, paper_cnts, -1, (0, 80, 0), cv2.FILLED)
+        cv2.addWeighted(overlay, 0.18, debug, 0.82, 0, debug)
+
+        # Show paper pixel count
+        cv2.putText(debug, f'paper_px={paper_px}',
+                    (10, self._frame_h - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 0), 1)
+
+        # ── Shape contour live preview ─────────────────────────────────────────
+        if not self._locked and paper_px > 5000:
+            cnt, name = self._find_shape(frame, paper_mask)
+            if cnt is not None:
+                cv2.drawContours(debug, [cnt], -1, (0, 255, 255), 2)
+                x_bb, y_bb, bw_bb, bh_bb = cv2.boundingRect(cnt)
+                cv2.rectangle(debug,
+                              (x_bb, y_bb),
+                              (x_bb + bw_bb, y_bb + bh_bb),
+                              (255, 80, 0), 1)
+                cx, cy = self._centroid(cnt)
+                area   = cv2.contourArea(cnt)
+                cv2.putText(debug, f'{name} | area={int(area)}',
+                            (x_bb, y_bb - 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
+                # crosshair at centroid
+                cv2.drawMarker(debug, (cx, cy), (255, 255, 0),
+                               cv2.MARKER_CROSS, 16, 1)
+
+        # ── Status banner ──────────────────────────────────────────────────────
         if self._locked:
-            cv2.putText(debug, f'LOCKED | {self._shape_label}',
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8, (0, 165, 255), 2)
-        elif not self._paper_ready:
-            # ── KEY CHANGE: bypass paper gate if frame has white region ──────
-            paper_mask = self._detect_paper(frame)
-            white_px   = cv2.countNonZero(paper_mask)
-            if white_px > 5000:
+            status_txt   = f'LOCKED | {self._shape_label}'
+            status_color = (0, 165, 255)
+        elif paper_px > 5000:
+            if not self._paper_ready:
                 self._paper_ready = True
-                cv2.putText(debug, 'AUTO-DETECTED PAPER | call /detect_shape',
-                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.7, (0, 200, 0), 2)
-            else:
-                cv2.putText(debug,
-                            f'Waiting paper... white_px={white_px}',
-                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.7, (100, 100, 100), 2)
+            status_txt   = 'PAPER OK | call /detect_shape'
+            status_color = (0, 255, 0)
         else:
-            cv2.putText(debug, 'READY | call /detect_shape',
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8, (0, 255, 0), 2)
+            status_txt   = f'Waiting for paper... ({paper_px} px)'
+            status_color = (80, 80, 80)
+
+        cv2.putText(debug, status_txt,
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
 
         self._latest_debug = debug
 
     def _display_cb(self):
         if self._latest_debug is not None:
-            cv2.imshow('Shape Detection', self._latest_debug)
+            cv2.imshow(_WIN, self._latest_debug)
             cv2.waitKey(1)
 
     # ── Service handler ────────────────────────────────────────────────────────
 
     def _detect_srv_cb(self, request, response):
-        """
-        NO rclpy.spin_once() here — deadlock risk.
-        We collect frames by waiting on wall time instead.
-        """
         if self._locked:
             response.success = True
             response.message = f'Already locked on: {self._shape_label}'
@@ -151,38 +170,28 @@ class ShapeDetectionNode(Node):
             response.message = 'No camera frame received yet'
             return response
 
-        # Auto-bypass paper gate if white region is visible
         if not self._paper_ready:
-            frame      = self.bridge.imgmsg_to_cv2(
-                self._latest_frame, desired_encoding='bgr8')
+            frame      = self.bridge.imgmsg_to_cv2(self._latest_frame, desired_encoding='bgr8')
             paper_mask = self._detect_paper(frame)
             if cv2.countNonZero(paper_mask) > 5000:
                 self._paper_ready = True
-                self.get_logger().warn(
-                    'paper_ready auto-set from service call')
             else:
                 response.success = False
-                response.message = 'Paper not visible — check lighting/ArUco node'
+                response.message = 'Paper not visible'
                 return response
 
-        self.get_logger().info(
-            f'detect_shape called — collecting {LOCK_FRAMES} stable frames...')
-
-        shape_name = None
-        contour    = None
+        shape_name   = None
+        contour      = None
         stable_count = 0
         last_shape   = None
-
-        # Poll latest frame by wall time — no spin_once
-        deadline = time.time() + 3.0          # 3 second timeout
+        deadline     = time.time() + 3.0
 
         while time.time() < deadline:
             if self._latest_frame is None:
                 time.sleep(0.05)
                 continue
 
-            frame      = self.bridge.imgmsg_to_cv2(
-                self._latest_frame, desired_encoding='bgr8')
+            frame      = self.bridge.imgmsg_to_cv2(self._latest_frame, desired_encoding='bgr8')
             paper_mask = self._detect_paper(frame)
             cnt, name  = self._find_shape(frame, paper_mask)
 
@@ -192,14 +201,9 @@ class ShapeDetectionNode(Node):
                 time.sleep(0.05)
                 continue
 
-            if name == last_shape:
-                stable_count += 1
-            else:
-                stable_count = 1
-                last_shape   = name
-
-            self.get_logger().info(
-                f'  stability: {name} {stable_count}/{LOCK_FRAMES}')
+            stable_count = stable_count + 1 if name == last_shape else 1
+            last_shape   = name
+            self.get_logger().info(f'  stability: {name} {stable_count}/{LOCK_FRAMES}')
 
             if stable_count >= LOCK_FRAMES:
                 shape_name = name
@@ -210,20 +214,33 @@ class ShapeDetectionNode(Node):
 
         if contour is None:
             response.success = False
-            response.message = 'Shape not stable after 3s — check MIN_SHAPE_AREA or lighting'
+            response.message = 'Shape not stable after 3s'
             return response
 
-        # ── Build waypoints ────────────────────────────────────────────────────
-        frame        = self.bridge.imgmsg_to_cv2(
-            self._latest_frame, desired_encoding='bgr8')
+        frame        = self.bridge.imgmsg_to_cv2(self._latest_frame, desired_encoding='bgr8')
         outline_pts  = self._sample_outline(contour)
-        fill_strokes = self._interior_fill(contour, frame.shape)
+        fill_strokes = self._brush_fill(contour, frame.shape)
 
+        outline_pts_out  = self._flip_uv(outline_pts)
+        fill_strokes_out = [self._flip_uv(s) for s in fill_strokes]
+
+        # ── Flat array encoding ────────────────────────────────────────────────
+        # Normal point:   [u, v]
+        # Reload marker:  [NaN, NaN, pause_s, lift_u, lift_v, Z_LIFT_MM]
+        #   lift_u, lift_v = last point of the just-finished stroke (robot stays XY)
+        #   executor: move to (lift_u, lift_v, z_current + Z_LIFT_MM), wait, descend
         flat = []
-        for (u, v) in outline_pts:
+        for (u, v) in outline_pts_out:
             flat += [float(u), float(v)]
-        for stroke in fill_strokes:
-            flat += [_NAN, _NAN]
+
+        for si, stroke in enumerate(fill_strokes_out):
+            if not stroke:
+                continue
+            last_u, last_v = stroke[-1]          # XY position to lift from
+            flat += [_NAN, _NAN,
+                     float(BRUSH_RELOAD_PAUSE_S),
+                     float(last_u), float(last_v),
+                     float(Z_LIFT_MM)]
             for (u, v) in stroke:
                 flat += [float(u), float(v)]
 
@@ -235,37 +252,73 @@ class ShapeDetectionNode(Node):
         msg_type.data = shape_name
         self.pub_type.publish(msg_type)
 
-        # ── Debug image ────────────────────────────────────────────────────────
+        # ── Debug image (original pixel space) ────────────────────────────────
         debug = frame.copy()
+
+        # Paper overlay
+        paper_mask_det = self._detect_paper(frame)
+        paper_cnts_det, _ = cv2.findContours(
+            paper_mask_det, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(debug, paper_cnts_det, -1, (0, 220, 0), 2)
+        overlay2 = debug.copy()
+        cv2.drawContours(overlay2, paper_cnts_det, -1, (0, 60, 0), cv2.FILLED)
+        cv2.addWeighted(overlay2, 0.15, debug, 0.85, 0, debug)
+
+        # Contour + bbox
         cv2.drawContours(debug, [contour], -1, (0, 255, 0), 2)
-        for (u, v) in outline_pts[::3]:
-            cv2.circle(debug, (int(u), int(v)), 2, (0, 255, 255), -1)
-        colors = [(0, 100, 255), (255, 100, 0), (200, 0, 200)]
-        for si, stroke in enumerate(fill_strokes):
-            for (u, v) in stroke:
-                cv2.circle(debug, (int(u), int(v)), 2,
-                           colors[si % len(colors)], -1)
+        x_bb, y_bb, bw_bb, bh_bb = cv2.boundingRect(contour)
+        cv2.rectangle(debug,
+                      (x_bb, y_bb),
+                      (x_bb + bw_bb, y_bb + bh_bb),
+                      (255, 80, 0), 1)
+
+        # Fill strokes (original pixel space)
+        colors = [(0, 180, 255), (255, 140, 0), (180, 0, 220)]
+        for si, stroke in enumerate(fill_strokes):       # original space for display
+            if not stroke:
+                continue
+            col = colors[si % len(colors)]
+            for i in range(len(stroke) - 1):
+                cv2.line(debug,
+                         (int(stroke[i][0]),   int(stroke[i][1])),
+                         (int(stroke[i+1][0]), int(stroke[i+1][1])),
+                         col, ROW_SPACING_PX // 2)
+            # Mark lift point at stroke end
+            eu, ev = int(stroke[-1][0]), int(stroke[-1][1])
+            cv2.drawMarker(debug, (eu, ev), (0, 0, 255),
+                           cv2.MARKER_TILTED_CROSS, 14, 2)
+            cv2.putText(debug,
+                        f'+{int(Z_LIFT_MM)}mm / {BRUSH_RELOAD_PAUSE_S}s',
+                        (eu + 6, ev - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 0, 255), 1)
+
         cx, cy = self._centroid(contour)
         total  = len(outline_pts) + sum(len(s) for s in fill_strokes)
         cv2.putText(debug, shape_name, (cx - 40, cy),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 0), 2)
         cv2.putText(debug,
-                    f'{total} pts | {1+len(fill_strokes)} strokes | LOCKED',
+                    f'{total} pts | {len(fill_strokes)} strokes | LOCKED | flip=UV',
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(debug,
+                    f'lift={int(Z_LIFT_MM)}mm x {len(fill_strokes)} | '
+                    f'reload={BRUSH_RELOAD_PAUSE_S}s each',
+                    (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 255), 1)
+
         self._latest_debug = debug
-        self.pub_debug.publish(
-            self.bridge.cv2_to_imgmsg(debug, encoding='bgr8'))
+        self.pub_debug.publish(self.bridge.cv2_to_imgmsg(debug, encoding='bgr8'))
 
         self._shape_label = shape_name
         self._locked      = True
 
         self.get_logger().info(
             f'LOCKED: {shape_name} | {total} pts | '
-            f'outline={len(outline_pts)} | fill_rows={len(fill_strokes)}')
+            f'outline={len(outline_pts)} | strokes={len(fill_strokes)} | '
+            f'z_lift={Z_LIFT_MM}mm | reload={BRUSH_RELOAD_PAUSE_S}s | flip=BOTH')
 
         response.success = True
-        response.message = (f'{shape_name} | {total} pts | '
-                            f'{1 + len(fill_strokes)} strokes')
+        response.message = (
+            f'{shape_name} | {total} pts | {len(fill_strokes)} strokes | '
+            f'z_lift={Z_LIFT_MM}mm | reload={BRUSH_RELOAD_PAUSE_S}s each')
         return response
 
     # ── Paper mask ─────────────────────────────────────────────────────────────
@@ -325,8 +378,7 @@ class ShapeDetectionNode(Node):
 
         arcs = [0.0]
         for i in range(1, n):
-            d = math.hypot(pts[i][0] - pts[i-1][0],
-                           pts[i][1] - pts[i-1][1])
+            d = math.hypot(pts[i][0] - pts[i-1][0], pts[i][1] - pts[i-1][1])
             arcs.append(arcs[-1] + d)
         total = arcs[-1]
         if total < 1e-6:
@@ -351,17 +403,17 @@ class ShapeDetectionNode(Node):
         sampled.append(sampled[0])
         return sampled
 
-    # ── Boustrophedon fill ─────────────────────────────────────────────────────
+    # ── Brush-aware boustrophedon fill ─────────────────────────────────────────
 
-    def _interior_fill(self, contour, frame_shape) -> list:
+    def _brush_fill(self, contour, frame_shape) -> list:
         hf, wf = frame_shape[:2]
         mask = np.zeros((hf, wf), dtype=np.uint8)
         cv2.drawContours(mask, [contour], -1, 255, thickness=cv2.FILLED)
 
-        erode_px = max(1, ROW_SPACING_PX // 3)
-        k_shape  = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (erode_px * 2 + 1, erode_px * 2 + 1))
-        inner    = cv2.erode(mask, k_shape, iterations=1)
+        brush_radius = max(1, ROW_SPACING_PX // 2)
+        k_shape = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (brush_radius * 2 + 1, brush_radius * 2 + 1))
+        inner = cv2.erode(mask, k_shape, iterations=1)
 
         x_bb, y_bb, bw_bb, bh_bb = cv2.boundingRect(contour)
 
@@ -375,9 +427,11 @@ class ShapeDetectionNode(Node):
             row_xs    = np.where(col_slice == 255)[0] + max(0, x_bb)
             if len(row_xs) < 2:
                 continue
+
             sampled = row_xs[::COL_SPACING_PX]
             if not l2r:
                 sampled = sampled[::-1]
+
             strokes.append([(float(u), float(row_y)) for u in sampled])
             l2r = not l2r
 
