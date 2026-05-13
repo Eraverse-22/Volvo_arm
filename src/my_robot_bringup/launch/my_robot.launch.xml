@@ -23,7 +23,7 @@
     <include file="$(find-pkg-share volvo_moveit)/launch/move_group.launch.py"/>
 
     <node pkg="tf2_ros" exec="static_transform_publisher" name="camera_tf_publisher"
-        args="--x 0.250 --y -0.134 --z 1.05
+        args="--x 0.230 --y -0.134 --z 1.05
         --roll 3.1416 --pitch 0.0 --yaw 0.0
         --frame-id base_link
         --child-frame-id camera_frame"/>

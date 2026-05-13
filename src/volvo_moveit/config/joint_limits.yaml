@@ -1,40 +1,84 @@
-# joint_limits.yaml allows the dynamics properties specified in the URDF to be overwritten or augmented as needed
 
-# For beginners, we downscale velocity and acceleration limits.
-# You can always specify higher scaling factors (<= 1.0) in your motion requests.  # Increase the values below to 1.0 to always move at maximum speed.
-default_velocity_scaling_factor: 0.1
-default_acceleration_scaling_factor: 0.1
+default_velocity_scaling_factor: 0.3       # raise from 0.1 → start testing here
+default_acceleration_scaling_factor: 0.2   # raise gradually; servos have no feedback on accel
 
-# Specific joint properties can be changed with the keys [max_position, min_position, max_velocity, max_acceleration]
-# Joint limits can be turned off with [has_velocity_limits, has_acceleration_limits]
 joint_limits:
   Joint_1:
     has_velocity_limits: true
-    max_velocity: 5.5099999999999998
+    max_velocity: 4.90        # MG995 derated at 5V under load
     has_acceleration_limits: true
-    max_acceleration: 1.0 
+    max_acceleration: 1.5     # raised; MG995 has decent torque (12 kg·cm)
   Joint_2:
     has_velocity_limits: true
-    max_velocity: 5.5099999999999998
+    max_velocity: 4.90
     has_acceleration_limits: true
-    max_acceleration: 1.0
+    max_acceleration: 1.2     # slightly lower — carries more arm weight
   Joint_3:
     has_velocity_limits: true
-    max_velocity: 5.5099999999999998
+    max_velocity: 4.90
     has_acceleration_limits: true
-    max_acceleration: 1.0
+    max_acceleration: 1.2
   Joint_4:
     has_velocity_limits: true
-    max_velocity: 10.470000000000001
+    max_velocity: 10.01       # MG90S derated at 5V
     has_acceleration_limits: true
-    max_acceleration: 1.0
+    max_acceleration: 2.0     # smaller inertia, faster response acceptable
   Joint_5:
     has_velocity_limits: true
-    max_velocity: 10.470000000000001
+    max_velocity: 10.01
     has_acceleration_limits: true
-    max_acceleration: 1.0
+    max_acceleration: 2.0
   Joint_6:
     has_velocity_limits: true
-    max_velocity: 10.470000000000001
+    max_velocity: 10.01
     has_acceleration_limits: true
-    max_acceleration: 1.0
+    max_acceleration: 2.0
+
+
+
+
+
+
+
+
+
+# # joint_limits.yaml allows the dynamics properties specified in the URDF to be overwritten or augmented as needed
+
+# # For beginners, we downscale velocity and acceleration limits.
+# # You can always specify higher scaling factors (<= 1.0) in your motion requests.  # Increase the values below to 1.0 to always move at maximum speed.
+# default_velocity_scaling_factor: 0.1
+# default_acceleration_scaling_factor: 0.1
+
+# # Specific joint properties can be changed with the keys [max_position, min_position, max_velocity, max_acceleration]
+# # Joint limits can be turned off with [has_velocity_limits, has_acceleration_limits]
+# joint_limits:
+#   Joint_1:
+#     has_velocity_limits: true
+#     max_velocity: 5.5099999999999998
+#     has_acceleration_limits: true
+#     max_acceleration: 1.0 
+#   Joint_2:
+#     has_velocity_limits: true
+#     max_velocity: 5.5099999999999998
+#     has_acceleration_limits: true
+#     max_acceleration: 1.0
+#   Joint_3:
+#     has_velocity_limits: true
+#     max_velocity: 5.5099999999999998
+#     has_acceleration_limits: true
+#     max_acceleration: 1.0
+#   Joint_4:
+#     has_velocity_limits: true
+#     max_velocity: 10.470000000000001
+#     has_acceleration_limits: true
+#     max_acceleration: 1.0
+#   Joint_5:
+#     has_velocity_limits: true
+#     max_velocity: 10.470000000000001
+#     has_acceleration_limits: true
+#     max_acceleration: 1.0
+#   Joint_6:
+#     has_velocity_limits: true
+#     max_velocity: 10.470000000000001
+#     has_acceleration_limits: true
+#     max_acceleration: 1.0

@@ -110,8 +110,8 @@
     <limit
       lower="0"
       upper="3.14"
-      effort="0.922"
-      velocity="5.51" />
+      effort="11.77"
+      velocity="5.24" />
   </joint>
                                                     <!-- Link_2 -->
   <link
@@ -170,8 +170,8 @@
     <limit
       lower="0"
       upper="3.14"
-      effort="0.922"
-      velocity="5.51" />
+      effort="11.77"
+      velocity="5.24" />
   </joint>
                                                     <!-- Link_3 -->
   <link
@@ -230,8 +230,8 @@
     <limit
       lower="0"
       upper="3.14"
-      effort="0.922"
-      velocity="5.51" />
+      effort="11.77"
+      velocity="5.24" />
   </joint>
                                                     <!-- Link_4 -->       
   <link
@@ -290,7 +290,7 @@
     <limit
       lower="0"
       upper="3.14"
-      effort="0.0177"
+      effort="1.96"
       velocity="10.47" />
   </joint>
                                                     <!-- Link_5 -->
@@ -350,7 +350,7 @@
     <limit
       lower="0"
       upper="3.14"
-      effort="0.0177"
+      effort="1.96"
       velocity="10.47" />
   </joint>
                                                      <!-- Link_6 -->         
@@ -410,7 +410,7 @@
     <limit
       lower="0"
       upper="3.14"
-      effort="0.0177"
+      effort="1.96"
       velocity="10.47" />
   </joint>
                                                       <!-- EE -->

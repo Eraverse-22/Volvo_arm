@@ -22,8 +22,8 @@ static constexpr double  Z_MIN          =  0.010;   // 1cm above table — hard 
 static constexpr double  Z_MAX          =  0.200;   // 20cm above table — hard ceiling
 static constexpr double  XY_RADIUS_MAX  =  0.450;   // 45cm from base_link origin
 
-static constexpr double  Z_HOVER  = 0.12;   // draw_start hover height
-static constexpr double  Z_TOUCH  = 0.017;   // pen touching paper
+static constexpr double  Z_HOVER  = 0.134;   // draw_start hover height
+static constexpr double  Z_TOUCH  = 0.01;   // pen touching paper
 
 int main(int argc, char* argv[])
 {

@@ -32,7 +32,7 @@ static constexpr double VEL_DRAW   = 0.15;   // drawing speed
 static constexpr double VEL_TRAVEL = 0.3;    // pen-lift travel speed
 static constexpr double ACC_SCALE  = 0.1;
 
-static constexpr double Z_TOUCH    = 0.017;  // pen touching paper
+static constexpr double Z_TOUCH    = 0.01;  // pen touching paper
 static constexpr double Z_HOVER    = 0.134;  // pen lifted (travel height)
 
 // Safety
